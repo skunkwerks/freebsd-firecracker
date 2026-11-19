@@ -19,8 +19,19 @@ env:
 
 jobs:
   kernel:
-    name: Build Kernel and Rootfs
+    name: Build Kernel and Rootfs (${{ matrix.variant }})
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: minimal
+            script: build-freebsd.sh
+            suffix: ""
+          # Same kernel, plus zfs, pf, bridge and jail support as modules
+          - variant: pkg-tiny
+            script: build-freebsd-pkg.sh
+            suffix: "-pkg-tiny"
 
     steps:
       - name: Checkout repository
@@ -126,13 +137,13 @@ jobs:
             sleep 5
           done
 
-          scp setup-vm.sh build-freebsd.sh prepare-rootfs.sh freebsd-tsc-init.patch freebsd-mptables.patch freebsd.id_rsa.pub fbsd:/root/
+          scp setup-vm.sh build-freebsd.sh build-freebsd-pkg.sh prepare-rootfs.sh freebsd-tsc-init.patch freebsd-mptables.patch freebsd.id_rsa.pub fbsd:/root/
           ssh fbsd /root/setup-vm.sh
           ssh fbsd df -h
 
       - name: Build FreeBSD rootfs and kernel
         run: |
-          ssh fbsd FREEBSD_VERSION="${FREEBSD_VERSION}" /root/build-freebsd.sh
+          ssh fbsd FREEBSD_VERSION="${FREEBSD_VERSION}" /root/${{ matrix.script }}
           ssh fbsd df -h
 
       - name: Prepare rootfs
@@ -142,8 +153,8 @@ jobs:
 
       - name: Copy kernel artifacts
         run: |
-          scp fbsd:/work/freebsd-kern.bin freebsd-kern.bin
-          scp fbsd:/work/freebsd-rootfs.bin.xz freebsd-rootfs.bin.xz
+          scp fbsd:/work/freebsd-kern.bin freebsd-kern${{ matrix.suffix }}.bin
+          scp fbsd:/work/freebsd-rootfs.bin.xz freebsd-rootfs${{ matrix.suffix }}.bin.xz
 
       - name: Serve built artifacts for the boot test
         run: |
@@ -152,11 +163,12 @@ jobs:
           cp "release-v${FIRECRACKER_VERSION}-x86_64/firecracker-v${FIRECRACKER_VERSION}-x86_64" firecracker
           nohup python3 -m http.server 8000 >/tmp/httpd.log 2>&1 &
           for i in $(seq 1 20); do
-            if curl -fsS "http://127.0.0.1:8000/freebsd-kern.bin" -o /dev/null; then break; fi
+            if curl -fsS "http://127.0.0.1:8000/freebsd-kern${{ matrix.suffix }}.bin" -o /dev/null; then break; fi
             sleep 1
           done
 
       - name: Boot-test with freebsd-firecracker-action
+        if: matrix.variant == 'minimal'
         uses: acj/freebsd-firecracker-action@v0.10.2
         with:
           kernel-url: http://127.0.0.1:8000/freebsd-kern.bin
@@ -187,25 +199,116 @@ jobs:
             done
             echo "trim assertions passed"
 
+      - name: Boot-test pkg-tiny image with freebsd-firecracker-action
+        if: matrix.variant == 'pkg-tiny'
+        uses: acj/freebsd-firecracker-action@v0.10.2
+        with:
+          kernel-url: http://127.0.0.1:8000/freebsd-kern-pkg-tiny.bin
+          rootfs-url: http://127.0.0.1:8000/freebsd-rootfs-pkg-tiny.bin.xz
+          firecracker-url: http://127.0.0.1:8000/firecracker
+          ssh-public-key-url: http://127.0.0.1:8000/freebsd.id_rsa.pub
+          ssh-private-key-url: http://127.0.0.1:8000/freebsd.id_rsa
+          checkout: false
+          verbose: true
+          pre-run: ""
+          post-run: ""
+          run-in-vm: |
+            set -eux
+            uname -a
+            bash --version | head -1
+            rsync --version | head -1
+            service -e
+
+            # The userland is installed from base system packages
+            pkg info -e FreeBSD-runtime FreeBSD-zfs FreeBSD-ssh FreeBSD-pf FreeBSD-jail FreeBSD-ipfw FreeBSD-rescue
+            for p in FreeBSD-bootloader FreeBSD-devmatch FreeBSD-efi-tools \
+                     FreeBSD-firmware-iwm FreeBSD-fwget FreeBSD-hyperv-tools \
+                     FreeBSD-kernel-man FreeBSD-locales FreeBSD-mandoc \
+                     FreeBSD-powerd FreeBSD-ppp FreeBSD-vt-data FreeBSD-wpa; do
+              if pkg info -e "$p"; then echo "FAIL: $p should not be installed" >&2; exit 1; fi
+            done
+
+            for f in /usr/bin/cc /usr/bin/clang /usr/bin/lldb \
+                     /usr/lib/clang /usr/sbin/dtrace /usr/sbin/bhyve /sbin/ipf \
+                     /usr/sbin/ntpd /usr/sbin/ppp /usr/sbin/bsnmpd \
+                     /boot/loader /boot/firmware /usr/bin/man; do
+              if [ -e "$f" ]; then echo "FAIL: $f should have been trimmed" >&2; exit 1; fi
+            done
+            for f in /bin/sh /usr/sbin/sshd /sbin/init /usr/local/bin/bash /usr/local/bin/rsync \
+                     /sbin/zfs /sbin/zpool /sbin/pfctl /sbin/dnctl /usr/sbin/jail \
+                     /rescue/sh /boot/kernel/linker.hints; do
+              test -e "$f" || { echo "FAIL: $f is missing" >&2; exit 1; }
+            done
+            echo "trim assertions passed"
+
+            # Nothing should be loaded until it is asked for
+            if kldstat -q -m zfs || kldstat -q -m pf; then
+              echo "FAIL: modules loaded at boot" >&2; exit 1
+            fi
+            for m in zfs pf pflog pfsync pflow dummynet if_bridge if_epair nullfs fdescfs; do
+              kldload -n "$m"
+            done
+            kldstat
+
+            # Load a ruleset and enable pf. It stays on for the jail test below
+            echo 'pass log all' > /tmp/pf.conf
+            pfctl -f /tmp/pf.conf
+            pfctl -e
+            pfctl -s rules
+            pfctl -s info
+
+            # A vnet jail on a zfs dataset, bridged to the host. The jail
+            # root is the host root, nullfs mounted read-only.
+            md=$(mdconfig -a -t swap -s 128m)
+            zpool create -m /fcpool fctest "/dev/$md"
+            zfs create fctest/jail
+            mount -t nullfs -o ro / /fcpool/jail
+
+            bridge=$(ifconfig bridge create)
+            ifconfig "$bridge" inet 10.99.0.1/24 up
+            epair=$(ifconfig epair create)
+            ifconfig "$epair" up
+            ifconfig "$bridge" addm "$epair"
+            jif="${epair%a}b"
+
+            jail -c name=fcjail path=/fcpool/jail host.hostname=fcjail \
+              mount.devfs vnet vnet.interface="$jif" persist
+            jexec fcjail ifconfig lo0 inet 127.0.0.1/8 up
+            jexec fcjail ifconfig "$jif" inet 10.99.0.2/24 up
+            jls -v
+            ifconfig "$bridge"
+            ping -c 3 -t 15 10.99.0.2
+            jexec fcjail ping -c 3 -t 15 10.99.0.1
+
+            # jail -r without a jail.conf leaves the devfs mount behind
+            jail -r fcjail
+            ifconfig "$epair" destroy
+            ifconfig "$bridge" destroy
+            umount /fcpool/jail/dev
+            umount /fcpool/jail
+            zpool destroy fctest
+            mdconfig -d -u "$md"
+            echo "module and jail assertions passed"
+
       - name: Upload serial console log
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: serial-console.log
+          name: serial-console-${{ matrix.variant }}.log
           path: serial.log
           if-no-files-found: ignore
 
       - name: Archive kernel artifact
         uses: actions/upload-artifact@v7
         with:
-          name: freebsd-kern.bin
-          path: freebsd-kern.bin
+          name: freebsd-kern${{ matrix.suffix }}.bin
+          path: freebsd-kern${{ matrix.suffix }}.bin
     
       - name: Archive rootfs artifact
         uses: actions/upload-artifact@v7
         with:
-          name: freebsd-rootfs.bin.xz
-          path: freebsd-rootfs.bin.xz
+          name: freebsd-rootfs${{ matrix.suffix }}.bin.xz
+          path: freebsd-rootfs${{ matrix.suffix }}.bin.xz
   
   firecracker:
     name: Vendor Firecracker binary
@@ -270,6 +373,18 @@ jobs:
           name: freebsd-rootfs.bin.xz
           path: freebsd-rootfs.bin.xz
 
+      - name: Download pkg-tiny kernel artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: freebsd-kern-pkg-tiny.bin
+          path: freebsd-kern-pkg-tiny.bin
+
+      - name: Download pkg-tiny rootfs artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: freebsd-rootfs-pkg-tiny.bin.xz
+          path: freebsd-rootfs-pkg-tiny.bin.xz
+
       - name: Download SSH public key
         uses: actions/download-artifact@v7
         with:
@@ -291,5 +406,7 @@ jobs:
             firecracker
             freebsd-kern.bin
             freebsd-rootfs.bin.xz
+            freebsd-kern-pkg-tiny.bin
+            freebsd-rootfs-pkg-tiny.bin.xz
             freebsd.id_rsa.pub
             freebsd.id_rsa
