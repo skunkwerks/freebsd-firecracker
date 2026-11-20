@@ -11,14 +11,16 @@ mount -t ufs /dev/md0 $dest_dir
 echo "Contents:"
 ls -l $dest_dir
 
-# Install basic packages
-ASSUME_ALWAYS_YES=YES pkg -c $dest_dir bootstrap -f || true
-ASSUME_ALWAYS_YES=YES pkg -c $dest_dir install -y bash rsync
+# Install basic packages. pkg and the package scripts need /dev in the chroot.
+# pkg bootstrap does not work there, so pkg is installed as a package.
+mount -t devfs devfs $dest_dir/dev
+ASSUME_ALWAYS_YES=YES pkg -c $dest_dir install -y pkg bash rsync
 
 # Drop the pkg repository catalog and any cached packages
 ASSUME_ALWAYS_YES=YES pkg -c $dest_dir clean -ay
 rm -f $dest_dir/var/cache/pkg/*
 rm -f $dest_dir/var/db/pkg/repo-*.sqlite
+umount $dest_dir/dev
 
 # SSH setup. Allow access to root using the key from this repo
 mkdir -p $dest_dir/root/.ssh
