@@ -1,0 +1,31 @@
+# A build and test environment to run with podman inside the pkg-tiny image.
+# The toolchain is in the image, so a CI job pulls it once instead of
+# installing packages on every run.
+#
+# The base userland comes from the FreeBSD base system packages: the
+# compiler, linker, make and the headers and libraries to link against,
+# plus kyua and atf for tests. Ports packages are on top. Pass PORTS to
+# change them, e.g. --build-arg PORTS="git-lite rust". They come from the
+# latest package set, not the quarterly one, also for packages installed
+# later in a running container.
+FROM ghcr.io/freebsd/freebsd-runtime:15.1
+ARG PORTS="git-lite cmake-core ninja pkgconf doas rust"
+ENV ASSUME_ALWAYS_YES=yes
+RUN mkdir -p /usr/local/etc/pkg/repos && \
+    echo 'FreeBSD-ports: { url: "pkg+https://pkg.FreeBSD.org/${ABI}/latest" }' \
+	> /usr/local/etc/pkg/repos/FreeBSD.conf && \
+    pkg bootstrap && \
+    pkg install -r FreeBSD-base \
+	FreeBSD-utilities FreeBSD-fetch FreeBSD-caroot FreeBSD-certctl \
+	FreeBSD-clang FreeBSD-lld FreeBSD-toolchain FreeBSD-bmake \
+	FreeBSD-clibs-dev FreeBSD-runtime-dev FreeBSD-utilities-dev \
+	FreeBSD-libcompiler_rt-dev FreeBSD-libexecinfo-dev \
+	FreeBSD-openssl-dev FreeBSD-zlib-dev \
+	FreeBSD-kyua FreeBSD-atf-dev && \
+    pkg install ${PORTS} && \
+    pkg clean -a && rm -rf /var/db/pkg/repos
+# Builds and tests should not run as root. doas lets them step up.
+RUN pw useradd ci -m -s /bin/sh && \
+    if [ -d /usr/local/etc ]; then echo 'permit nopass ci' > /usr/local/etc/doas.conf; fi
+WORKDIR /home/ci
+CMD ["/bin/sh"]

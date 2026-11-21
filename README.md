@@ -25,6 +25,8 @@ You probably won't need to use this repository directly unless you need to make 
 
 Firecracker boots the kernel directly, without a loader, so no modules are preloaded and boot time is the same as the minimal image. The modules live in `/boot/kernel` and are loaded when first used, e.g. by `zpool`, `ifconfig bridge create`, `service pf onestart` or `kldload`. To change the set, pass `FIRECRACKER_MODULES` to the script.
 
+The image has no compiler. `oci/Containerfile` describes a build and test environment to run with podman inside the VM: the base system toolchain, kyua, and `git`, `cmake`, `ninja`, `pkgconf`, `doas` and `rust` from ports, with a `ci` user. Build it with `podman build -t fc-test-env -f oci/Containerfile oci`, and pass `--build-arg PORTS="..."` to change the ports packages. CI builds it in the pkg-tiny image and pushes it to `ghcr.io/skunkwerks/freebsd-firecracker-env`, tagged with the FreeBSD version, e.g. `15.1`, and with the release tag.
+
 ## Limitations
 
 - FreeBSD 14+ because we need recent Firecracker-related changes

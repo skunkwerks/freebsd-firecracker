@@ -169,7 +169,7 @@ jobs:
 
       - name: Boot-test with freebsd-firecracker-action
         if: matrix.variant == 'minimal'
-        uses: acj/freebsd-firecracker-action@v0.10.2
+        uses: acj/freebsd-firecracker-action@v0.13.1
         with:
           kernel-url: http://127.0.0.1:8000/freebsd-kern.bin
           rootfs-url: http://127.0.0.1:8000/freebsd-rootfs.bin.xz
@@ -201,7 +201,7 @@ jobs:
 
       - name: Boot-test pkg-tiny image with freebsd-firecracker-action
         if: matrix.variant == 'pkg-tiny'
-        uses: acj/freebsd-firecracker-action@v0.10.2
+        uses: acj/freebsd-firecracker-action@v0.13.1
         with:
           kernel-url: http://127.0.0.1:8000/freebsd-kern-pkg-tiny.bin
           rootfs-url: http://127.0.0.1:8000/freebsd-rootfs-pkg-tiny.bin.xz
@@ -209,8 +209,10 @@ jobs:
           ssh-public-key-url: http://127.0.0.1:8000/freebsd.id_rsa.pub
           ssh-private-key-url: http://127.0.0.1:8000/freebsd.id_rsa
           checkout: false
+          disk-size: 8G
           verbose: true
-          pre-run: ""
+          pre-run: |
+            scp oci/Containerfile firecracker:Containerfile
           post-run: ""
           run-in-vm: |
             set -eux
@@ -290,6 +292,36 @@ jobs:
             mdconfig -d -u "$md"
             echo "module and jail assertions passed"
 
+            # podman with ocijail, image storage on zfs and container
+            # networking through pf. pf is still enabled from above.
+            pkg install -y podman
+            truncate -s 5g /var/tmp/fcpod.img
+            md=$(mdconfig -a -t vnode -f /var/tmp/fcpod.img)
+            zpool create -m none -O compression=zstd fcpod "/dev/$md"
+            zfs create -o mountpoint=/var/db/containers fcpod/containers
+            mount -t fdescfs fdesc /dev/fd
+
+            egress=$(route -n get default | awk '/interface:/ { print $2 }')
+            gateway=$(route -n get default | awk '/gateway:/ { print $2 }')
+            sed "s/ix0/$egress/" /usr/local/etc/containers/pf.conf.sample > /etc/pf.conf
+            echo 'pass log all' >> /etc/pf.conf
+            pfctl -f /etc/pf.conf
+            pfctl -s nat
+
+            podman info
+            image=ghcr.io/freebsd/freebsd-runtime:15.1
+            podman run --rm "$image" freebsd-version
+            podman run --rm "$image" ping -c 3 -t 15 "$gateway"
+
+            # Build the test environment image, without the ports packages
+            # to keep it short, and compile something in it
+            podman build --build-arg PORTS=pkgconf -t fc-test-env -f Containerfile .
+            podman run --rm --user ci fc-test-env /bin/sh -c \
+              'echo "int main(void){return 0;}" > t.c && cc -o t t.c && ./t && kyua help > /dev/null'
+            podman images
+            zfs list -r fcpod
+            echo "podman assertions passed"
+
       - name: Upload serial console log
         if: failure()
         uses: actions/upload-artifact@v7
@@ -347,6 +379,99 @@ jobs:
         with:
           name: freebsd.id_rsa
           path: freebsd.id_rsa
+
+  # Build oci/Containerfile with podman in the pkg-tiny image and push it to
+  # ghcr.io/skunkwerks. A FreeBSD image has to be built on FreeBSD, so this
+  # cannot run on the Linux runner itself.
+  image:
+    name: Publish test environment image
+    needs: [firecracker, kernel]
+    if: github.repository_owner == 'skunkwerks'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Enable KVM access
+        run: sudo chmod 0666 /dev/kvm && test -w /dev/kvm
+
+      - name: Download firecracker artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: firecracker
+
+      - name: Download pkg-tiny kernel artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: freebsd-kern-pkg-tiny.bin
+
+      - name: Download pkg-tiny rootfs artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: freebsd-rootfs-pkg-tiny.bin.xz
+
+      - name: Serve the artifacts for the VM action
+        run: |
+          set -eux
+          nohup python3 -m http.server 8000 >/tmp/httpd.log 2>&1 &
+          for i in $(seq 1 20); do
+            if curl -fsS http://127.0.0.1:8000/freebsd-kern-pkg-tiny.bin -o /dev/null; then break; fi
+            sleep 1
+          done
+
+      - name: Build and push the image in a FreeBSD VM
+        uses: acj/freebsd-firecracker-action@v0.13.1
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          kernel-url: http://127.0.0.1:8000/freebsd-kern-pkg-tiny.bin
+          rootfs-url: http://127.0.0.1:8000/freebsd-rootfs-pkg-tiny.bin.xz
+          firecracker-url: http://127.0.0.1:8000/firecracker
+          ssh-public-key-url: http://127.0.0.1:8000/freebsd.id_rsa.pub
+          ssh-private-key-url: http://127.0.0.1:8000/freebsd.id_rsa
+          checkout: false
+          disk-size: 16G
+          pre-run: |
+            scp oci/Containerfile firecracker:Containerfile
+            printf '%s\n' "$GHCR_TOKEN" | ssh firecracker 'umask 077; cat > ghcr.token'
+          post-run: ""
+          run-in-vm: |
+            set -eu
+            image=ghcr.io/skunkwerks/freebsd-firecracker-env
+            version=$(freebsd-version -u | cut -d- -f1)
+
+            pkg install -y podman
+            truncate -s 12g /var/tmp/fcpod.img
+            md=$(mdconfig -a -t vnode -f /var/tmp/fcpod.img)
+            zpool create -m none -O compression=zstd fcpod "/dev/$md"
+            zfs create -o mountpoint=/var/db/containers fcpod/containers
+            mount -t fdescfs fdesc /dev/fd
+
+            egress=$(route -n get default | awk '/interface:/ { print $2 }')
+            sed "s/ix0/$egress/" /usr/local/etc/containers/pf.conf.sample > /etc/pf.conf
+            echo 'pass all' >> /etc/pf.conf
+            kldload -n pf
+            pfctl -f /etc/pf.conf
+            pfctl -e
+
+            podman build -t "$image:$version" \
+              --label org.opencontainers.image.source=https://github.com/${{ github.repository }} \
+              -f Containerfile .
+            podman run --rm --user ci "$image:$version" /bin/sh -c \
+              'echo "int main(void){return 0;}" > t.c && cc -o t t.c && ./t && cargo --version'
+            podman images
+
+            podman login -u ${{ github.actor }} --password-stdin ghcr.io < ghcr.token
+            rm -f ghcr.token
+            podman push "$image:$version"
+            if [ "${{ github.ref_type }}" = tag ]; then
+              podman tag "$image:$version" "$image:${{ github.ref_name }}"
+              podman push "$image:${{ github.ref_name }}"
+            fi
 
   release:
     name: Publish release
