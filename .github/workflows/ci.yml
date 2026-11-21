@@ -32,6 +32,10 @@ jobs:
           - variant: pkg-tiny
             script: build-freebsd-pkg.sh
             suffix: "-pkg-tiny"
+          # The pkg-tiny userland on a zfs pool, with zfs in the kernel
+          - variant: pkg-zfs
+            script: build-freebsd-pkg.sh zfs
+            suffix: "-pkg-zfs"
 
     steps:
       - name: Checkout repository
@@ -199,12 +203,12 @@ jobs:
             done
             echo "trim assertions passed"
 
-      - name: Boot-test pkg-tiny image with freebsd-firecracker-action
-        if: matrix.variant == 'pkg-tiny'
+      - name: Boot-test pkg image with freebsd-firecracker-action
+        if: matrix.variant != 'minimal'
         uses: acj/freebsd-firecracker-action@v0.13.1
         with:
-          kernel-url: http://127.0.0.1:8000/freebsd-kern-pkg-tiny.bin
-          rootfs-url: http://127.0.0.1:8000/freebsd-rootfs-pkg-tiny.bin.xz
+          kernel-url: http://127.0.0.1:8000/freebsd-kern${{ matrix.suffix }}.bin
+          rootfs-url: http://127.0.0.1:8000/freebsd-rootfs${{ matrix.suffix }}.bin.xz
           firecracker-url: http://127.0.0.1:8000/firecracker
           ssh-public-key-url: http://127.0.0.1:8000/freebsd.id_rsa.pub
           ssh-private-key-url: http://127.0.0.1:8000/freebsd.id_rsa
@@ -243,12 +247,29 @@ jobs:
             done
             echo "trim assertions passed"
 
-            # Nothing should be loaded until it is asked for
-            if kldstat -q -m zfs || kldstat -q -m pf; then
+            # pkg-zfs has its root on a pool, with zfs in the kernel. The
+            # pool should have grown to the size of the disk on first boot.
+            rootfs=$(mount -p | awk '$2 == "/" { print $3 }')
+            if [ "${{ matrix.variant }}" = pkg-zfs ]; then
+              test "$rootfs" = zfs
+              zpool status zroot
+              zfs list -r zroot
+              test "$(zpool list -Hp -o size zroot)" -gt $((4 * 1024 * 1024 * 1024))
+              # The pool is upgraded on first boot
+              zpool get -H -o value feature@zstd_compress zroot | grep -E '^(enabled|active)$'
+              test ! -e /boot/kernel/zfs.ko
+            else
+              test "$rootfs" = ufs
+              # Nothing should be loaded until it is asked for
+              if kldstat -q -m zfs; then
+                echo "FAIL: zfs loaded at boot" >&2; exit 1
+              fi
+            fi
+            if kldstat -q -m pf; then
               echo "FAIL: modules loaded at boot" >&2; exit 1
             fi
             for m in zfs pf pflog pfsync pflow dummynet if_bridge if_epair nullfs fdescfs; do
-              kldload -n "$m"
+              kldstat -q -m "$m" || kldload -n "$m"
             done
             kldstat
 
@@ -295,10 +316,15 @@ jobs:
             # podman with ocijail, image storage on zfs and container
             # networking through pf. pf is still enabled from above.
             pkg install -y podman
-            truncate -s 5g /var/tmp/fcpod.img
-            md=$(mdconfig -a -t vnode -f /var/tmp/fcpod.img)
-            zpool create -m none -O compression=zstd fcpod "/dev/$md"
-            zfs create -o mountpoint=/var/db/containers fcpod/containers
+            if [ "$rootfs" = zfs ]; then
+              pool=zroot
+            else
+              pool=fcpod
+              truncate -s 5g /var/tmp/fcpod.img
+              md=$(mdconfig -a -t vnode -f /var/tmp/fcpod.img)
+              zpool create -m none fcpod "/dev/$md"
+            fi
+            zfs create -o mountpoint=/var/db/containers -o compression=zstd "$pool/containers"
             mount -t fdescfs fdesc /dev/fd
 
             egress=$(route -n get default | awk '/interface:/ { print $2 }')
@@ -319,7 +345,7 @@ jobs:
             podman run --rm --user ci fc-test-env /bin/sh -c \
               'echo "int main(void){return 0;}" > t.c && cc -o t t.c && ./t && kyua help > /dev/null'
             podman images
-            zfs list -r fcpod
+            zfs list -r "$pool"
             echo "podman assertions passed"
 
       - name: Upload serial console log
@@ -510,6 +536,18 @@ jobs:
           name: freebsd-rootfs-pkg-tiny.bin.xz
           path: freebsd-rootfs-pkg-tiny.bin.xz
 
+      - name: Download pkg-zfs kernel artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: freebsd-kern-pkg-zfs.bin
+          path: freebsd-kern-pkg-zfs.bin
+
+      - name: Download pkg-zfs rootfs artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: freebsd-rootfs-pkg-zfs.bin.xz
+          path: freebsd-rootfs-pkg-zfs.bin.xz
+
       - name: Download SSH public key
         uses: actions/download-artifact@v7
         with:
@@ -533,5 +571,7 @@ jobs:
             freebsd-rootfs.bin.xz
             freebsd-kern-pkg-tiny.bin
             freebsd-rootfs-pkg-tiny.bin.xz
+            freebsd-kern-pkg-zfs.bin
+            freebsd-rootfs-pkg-zfs.bin.xz
             freebsd.id_rsa.pub
             freebsd.id_rsa

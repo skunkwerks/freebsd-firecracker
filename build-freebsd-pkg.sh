@@ -2,6 +2,16 @@
 
 set -e
 
+# The root file system of the image: "tiny" is UFS, with zfs as a module
+# like everything else. "zfs" is a pool, with zfs compiled into the kernel,
+# since there is no loader to load a module before root is mounted.
+variant="${1:-tiny}"
+case "$variant" in
+tiny)	rootfs=ufs; rootdev="ufs:/dev/vtbd0" ;;
+zfs)	rootfs=zfs; rootdev="zfs:zroot/ROOT/default" ;;
+*)	echo "usage: $0 [tiny|zfs]" >&2; exit 1 ;;
+esac
+
 cd /work
 
 cat <<END > /etc/src.conf
@@ -105,6 +115,7 @@ firecracker-freebsd-kern.bin:
 FCWDIR=	${.OBJDIR}/${TARGET}/firecracker-world
 FCMODDIR=	${FCWDIR}/boot/kernel
 FCROOTFSSZ?=	1g
+FCROOTFS?=	ufs
 FREEBSD_VERSION?=	15.1-RELEASE
 # Userland comes from the FreeBSD base system packages (pkgbase). The repo
 # follows the release branch, so it includes security and errata patches.
@@ -149,7 +160,16 @@ firecracker-freebsd-rootfs.bin: firecracker-freebsd-kern.bin
 	${FCPKG} install -y -r FreeBSD-base \
 	    $$(cat ${FCPKGREPOS}/pkglist) ${FCPKGS}
 	rm -rf ${FCWDIR}/var/cache/pkg/* ${FCWDIR}/var/db/pkg/repos
+.if ${FCROOTFS} == "zfs"
+	: > ${FCWDIR}/etc/fstab
+	echo 'zfs_enable="YES"' >> ${FCWDIR}/etc/rc.conf
+	# makefs makes a pool with no feature flags and the same guid in
+	# every copy of the image. Fix both on first boot.
+	echo 'zpool_reguid="zroot"' >> ${FCWDIR}/etc/rc.conf
+	echo 'zpool_upgrade="zroot"' >> ${FCWDIR}/etc/rc.conf
+.else
 	echo '/dev/ufs/rootfs / ufs rw 1 1' > ${FCWDIR}/etc/fstab
+.endif
 	echo 'hostname="freebsd"' >> ${FCWDIR}/etc/rc.conf
 	echo 'ifconfig_vtnet0="inet 172.16.0.2 netmask 255.255.255.0"' >> ${FCWDIR}/etc/rc.conf
 	echo 'defaultrouter="172.16.0.1"' >> ${FCWDIR}/etc/rc.conf
@@ -170,13 +190,22 @@ firecracker-freebsd-rootfs.bin: firecracker-freebsd-kern.bin
 	cp ${FCKDIR}/boot/kernel/*.ko ${FCMODDIR}/
 	kldxref ${FCMODDIR}
 	touch ${FCWDIR}/firstboot
+.if ${FCROOTFS} == "zfs"
+	makefs -t zfs -s ${FCROOTFSSZ} \
+	    -o poolname=zroot -o bootfs=zroot/ROOT/default -o rootpath=/ \
+	    -o fs=zroot\;mountpoint=none \
+	    -o fs=zroot/ROOT\;mountpoint=none \
+	    -o fs=zroot/ROOT/default\;mountpoint=/\;canmount=noauto \
+	    ${DESTDIR}/freebsd-rootfs.bin ${FCWDIR}
+.else
 	makefs -s ${FCROOTFSSZ} -o label=rootfs -o version=2 -o softupdates=1 \
 	    ${DESTDIR}/freebsd-rootfs.bin ${FCWDIR}
+.endif
 END
 
 # Without this, we end up at the mountroot prompt when booting the VM
 cat <<END >> /work/src/sys/amd64/conf/FIRECRACKER
-options ROOTDEVNAME=\"ufs:/dev/vtbd0\"
+options ROOTDEVNAME=\"${rootdev}\"
 END
 
 # Build only the modules that we ship in the rootfs. The kernel itself stays
@@ -186,6 +215,11 @@ END
 # pf's dnpipe and dnqueue rules. ALTQ queueing is not available, it can only
 # be compiled into the kernel.
 FIRECRACKER_MODULES="${FIRECRACKER_MODULES:-zfs pf pflog pfsync pflow dummynet if_bridge bridgestp if_epair nullfs fdescfs}"
+if [ "$rootfs" = zfs ]; then
+	# zfs cannot be both in the kernel and a module
+	FIRECRACKER_MODULES=$(echo " $FIRECRACKER_MODULES " | sed 's/ zfs / /')
+	echo 'options ZFS' >> /work/src/sys/amd64/conf/FIRECRACKER
+fi
 cat <<END >> /work/src/sys/amd64/conf/FIRECRACKER
 makeoptions MODULES_OVERRIDE="${FIRECRACKER_MODULES}"
 END
@@ -205,4 +239,4 @@ pkg -N 2>/dev/null || env ASSUME_ALWAYS_YES=yes pkg bootstrap
 
 make -j$(($(sysctl -n hw.ncpu) + 2)) -C /work/src buildkernel KERNCONF=FIRECRACKER
 
-make -C /work/src/release firecracker DESTDIR=$(pwd) FREEBSD_VERSION="${FREEBSD_VERSION}"
+make -C /work/src/release firecracker DESTDIR=$(pwd) FREEBSD_VERSION="${FREEBSD_VERSION}" FCROOTFS="${rootfs}"

@@ -6,7 +6,15 @@ cd /work
 
 dest_dir="/mnt"
 mdconfig -f freebsd-rootfs.bin -u 0
-mount -t ufs /dev/md0 $dest_dir
+# The image is either a UFS file system or a zfs pool made by makefs
+rootfs=$(fstyp -u /dev/md0)
+if [ "$rootfs" = zfs ]; then
+	kldload -n zfs
+	zpool import -f -N -R $dest_dir zroot
+	zfs mount zroot/ROOT/default
+else
+	mount -t ufs /dev/md0 $dest_dir
+fi
 
 echo "Contents:"
 ls -l $dest_dir
@@ -34,7 +42,11 @@ echo "" > $dest_dir/etc/motd.template
 
 du -hs $dest_dir/*
 
-umount $dest_dir
+if [ "$rootfs" = zfs ]; then
+	zpool export zroot
+else
+	umount $dest_dir
+fi
 mdconfig -d -u 0
 
 xz -z -T 0 freebsd-rootfs.bin

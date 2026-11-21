@@ -18,6 +18,7 @@ You probably won't need to use this repository directly unless you need to make 
 - [X] Supports Intel and AMD CPUs
 - [X] Boots \~instantly in GitHub Actions, excluding download and configuration time
 - [X] Optional "pkg-tiny" image with ZFS, pf and bridged vnet jails
+- [X] Optional "pkg-zfs" image, the same with its root on a ZFS pool
 
 ## pkg-tiny image
 
@@ -25,7 +26,11 @@ You probably won't need to use this repository directly unless you need to make 
 
 Firecracker boots the kernel directly, without a loader, so no modules are preloaded and boot time is the same as the minimal image. The modules live in `/boot/kernel` and are loaded when first used, e.g. by `zpool`, `ifconfig bridge create`, `service pf onestart` or `kldload`. To change the set, pass `FIRECRACKER_MODULES` to the script.
 
-The image has no compiler. `oci/Containerfile` describes a build and test environment to run with podman inside the VM: the base system toolchain, kyua, and `git`, `cmake`, `ninja`, `pkgconf`, `doas` and `rust` from ports, with a `ci` user. Build it with `podman build -t fc-test-env -f oci/Containerfile oci`, and pass `--build-arg PORTS="..."` to change the ports packages. CI builds it in the pkg-tiny image and pushes it to `ghcr.io/skunkwerks/freebsd-firecracker-env`, tagged with the FreeBSD version, e.g. `15.1`, and with the release tag.
+## pkg-zfs image
+
+`build-freebsd-pkg.sh zfs` builds the pkg-tiny userland onto a ZFS pool instead of UFS. The pool is `zroot`, made with `makefs -t zfs`, with the root file system in `zroot/ROOT/default`, and it grows to the size of the disk on first boot. There is no loader to load `zfs.ko` before the root file system is mounted, so ZFS is compiled into this kernel, which makes it about 2.7 MB larger than the others. The other modules are still loaded on demand. It is published as `freebsd-kern-pkg-zfs.bin` and `freebsd-rootfs-pkg-zfs.bin.xz`.
+
+Both pkg images have no compiler. `oci/Containerfile` describes a build and test environment to run with podman inside either of them: the base system toolchain, kyua, and `git`, `cmake`, `ninja`, `pkgconf`, `doas` and `rust` from ports, with a `ci` user. Build it with `podman build -t fc-test-env -f oci/Containerfile oci`, and pass `--build-arg PORTS="..."` to change the ports packages. CI builds it in the pkg-tiny image and pushes it to `ghcr.io/skunkwerks/freebsd-firecracker-env`, tagged with the FreeBSD version, e.g. `15.1`, and with the release tag.
 
 ## Limitations
 
